@@ -52,9 +52,6 @@ dependencies = [
 [[package]]
 name = "raft-core"
 version = "0.1.0"
-dependencies = [
- "thiserror",
-]
 
 [[package]]
 name = "serde"
@@ -89,10 +86,6 @@ dependencies = [
 [[package]]
 name = "storage"
 version = "0.1.0"
-dependencies = [
- "raft-core",
- "thiserror",
-]
 
 [[package]]
 name = "syn"

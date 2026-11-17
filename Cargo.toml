@@ -13,11 +13,6 @@ version = "0.1.0"
 rust-version = "1.100"
 
 [workspace.dependencies]
-# internal
-raft-core = { path = "crates/raft-core" }
-kv-engine = { path = "crates/kv-engine" }
-storage   = { path = "crates/storage" }
-
 # external
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
