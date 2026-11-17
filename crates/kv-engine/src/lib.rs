@@ -1,6 +1,6 @@
-//! Deterministic key-value state machine for Jatayu.
+//! Deterministic key-value state machine for rawraft.
 //!
-//! Every node in a Jatayu cluster runs this state machine over the same
+//! Every node in a rawraft cluster runs this state machine over the same
 //! committed log, so applying the same commands in the same order to an empty
 //! state machine must produce the same state **and the same snapshot bytes** on
 //! every node. Snapshots are compared and transferred between nodes, so

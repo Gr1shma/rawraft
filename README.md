@@ -1,4 +1,4 @@
-Jatayu is a distributed key-value store built in Rust using the Raft consensus algorithm.
+rawraft is a distributed key-value store built in Rust using the Raft consensus algorithm, implemented from scratch.
 
 - [x] Workspace and crate skeleton
 - [x] KV engine, session dedup, snapshot/restore
