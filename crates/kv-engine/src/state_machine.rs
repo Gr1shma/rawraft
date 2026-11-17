@@ -1,12 +1,21 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{ClientId, ClientRequest, Engine, Error, Response, Result};
 
 /// What we remember about a client's latest request.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Session {
     last_sequence: u64,
     last_response: Response,
+}
+
+/// The bytes we write for a snapshot: engine state plus the session table.
+#[derive(Debug, Serialize, Deserialize)]
+struct Snapshot {
+    engine: Vec<u8>,
+    sessions: BTreeMap<ClientId, Session>,
 }
 
 /// Wraps an [`Engine`] so that each client request is applied exactly once.
@@ -56,6 +65,35 @@ impl<E: Engine> StateMachine<E> {
             },
         );
         Ok(response)
+    }
+
+    /// Serializes the engine state and the session table together.
+    ///
+    /// # Errors
+    /// Returns an error if the engine or the encoder fails.
+    pub fn snapshot(&self) -> Result<Vec<u8>> {
+        let snapshot = Snapshot {
+            engine: self.engine.snapshot()?,
+            sessions: self.sessions.clone(),
+        };
+        Ok(bincode::serde::encode_to_vec(
+            &snapshot,
+            bincode::config::standard(),
+        )?)
+    }
+
+    /// Restores engine state and sessions from [`StateMachine::snapshot`].
+    ///
+    /// # Errors
+    /// Returns an error if `data` is corrupt. State is unchanged on error.
+    pub fn restore(&mut self, data: &[u8]) -> Result<()> {
+        let (snapshot, _): (Snapshot, usize) =
+            bincode::serde::decode_from_slice(data, bincode::config::standard())?;
+        // The engine restore can still fail; do it before touching sessions
+        // so an error leaves everything as it was.
+        self.engine.restore(&snapshot.engine)?;
+        self.sessions = snapshot.sessions;
+        Ok(())
     }
 }
 
@@ -147,5 +185,50 @@ mod tests {
                 sequence: 1
             })
         ));
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_data_and_sessions() {
+        let mut original = StateMachine::new(MemEngine::new());
+        let req = request(1, 1, cas_create("a", "1"));
+        original.apply(&req).unwrap();
+        let bytes = original.snapshot().unwrap();
+
+        let mut restored = StateMachine::new(MemEngine::new());
+        restored.restore(&bytes).unwrap();
+
+        // The data came across.
+        let get = Command::Get { key: b"a".to_vec() };
+        assert_eq!(
+            restored.apply(&request(2, 1, get)).unwrap(),
+            Response::Value(Some(b"1".to_vec()))
+        );
+        // The session came across: the retry returns the saved response
+        // instead of failing the CAS a second time.
+        assert_eq!(
+            restored.apply(&req).unwrap(),
+            Response::Cas {
+                success: true,
+                current: Some(b"1".to_vec())
+            }
+        );
+    }
+
+    #[test]
+    fn restore_with_corrupt_data_leaves_state_unchanged() {
+        let mut sm = StateMachine::new(MemEngine::new());
+        let req = request(1, 1, cas_create("a", "1"));
+        sm.apply(&req).unwrap();
+
+        assert!(sm.restore(b"garbage").is_err());
+
+        // Data and session are both still there.
+        assert_eq!(
+            sm.apply(&req).unwrap(),
+            Response::Cas {
+                success: true,
+                current: Some(b"1".to_vec())
+            }
+        );
     }
 }
