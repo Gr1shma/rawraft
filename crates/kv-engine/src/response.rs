@@ -12,4 +12,11 @@ pub enum Response {
         /// Whether the key existed before deletion.
         existed: bool,
     },
+    /// Result of a `Cas`.
+    Cas {
+        /// Whether the swap was performed.
+        success: bool,
+        /// The value of the key after the operation.
+        current: Option<Vec<u8>>,
+    },
 }

@@ -30,6 +30,31 @@ impl Engine for MemEngine {
             Command::Delete { key } => Response::Deleted {
                 existed: self.data.remove(key).is_some(),
             },
+            Command::Cas {
+                key,
+                expected,
+                value,
+            } => {
+                if self.data.get(key) == expected.as_ref() {
+                    match value {
+                        Some(v) => {
+                            self.data.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            self.data.remove(key);
+                        }
+                    }
+                    Response::Cas {
+                        success: true,
+                        current: value.clone(),
+                    }
+                } else {
+                    Response::Cas {
+                        success: false,
+                        current: self.data.get(key).cloned(),
+                    }
+                }
+            }
         }
     }
 
@@ -64,6 +89,14 @@ mod tests {
         Command::Get { key: key.into() }
     }
 
+    fn cas(key: &str, expected: Option<&str>, value: Option<&str>) -> Command {
+        Command::Cas {
+            key: key.into(),
+            expected: expected.map(Into::into),
+            value: value.map(Into::into),
+        }
+    }
+
     #[test]
     fn put_then_get_returns_value() {
         let mut engine = MemEngine::new();
@@ -88,6 +121,79 @@ mod tests {
         let del = Command::Delete { key: b"a".to_vec() };
         assert_eq!(engine.apply(&del), Response::Deleted { existed: true });
         assert_eq!(engine.apply(&del), Response::Deleted { existed: false });
+        assert_eq!(engine.apply(&get("a")), Response::Value(None));
+    }
+
+    #[test]
+    fn cas_succeeds_when_expected_matches() {
+        let mut engine = MemEngine::new();
+        engine.apply(&put("a", "1"));
+
+        assert_eq!(
+            engine.apply(&cas("a", Some("1"), Some("2"))),
+            Response::Cas {
+                success: true,
+                current: Some(b"2".to_vec())
+            }
+        );
+        assert_eq!(
+            engine.apply(&get("a")),
+            Response::Value(Some(b"2".to_vec()))
+        );
+    }
+
+    #[test]
+    fn cas_fails_when_expected_differs() {
+        let mut engine = MemEngine::new();
+        engine.apply(&put("a", "1"));
+
+        assert_eq!(
+            engine.apply(&cas("a", Some("wrong"), Some("2"))),
+            Response::Cas {
+                success: false,
+                current: Some(b"1".to_vec())
+            }
+        );
+        assert_eq!(
+            engine.apply(&get("a")),
+            Response::Value(Some(b"1".to_vec()))
+        );
+    }
+
+    #[test]
+    fn cas_with_none_expected_requires_absent_key() {
+        let mut engine = MemEngine::new();
+
+        // Key is absent, so this succeeds.
+        assert_eq!(
+            engine.apply(&cas("a", None, Some("1"))),
+            Response::Cas {
+                success: true,
+                current: Some(b"1".to_vec())
+            }
+        );
+        // Key now exists, so the same command fails.
+        assert_eq!(
+            engine.apply(&cas("a", None, Some("2"))),
+            Response::Cas {
+                success: false,
+                current: Some(b"1".to_vec())
+            }
+        );
+    }
+
+    #[test]
+    fn cas_with_none_value_deletes_key() {
+        let mut engine = MemEngine::new();
+        engine.apply(&put("a", "1"));
+
+        assert_eq!(
+            engine.apply(&cas("a", Some("1"), None)),
+            Response::Cas {
+                success: true,
+                current: None
+            }
+        );
         assert_eq!(engine.apply(&get("a")), Response::Value(None));
     }
 

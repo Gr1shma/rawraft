@@ -20,4 +20,14 @@ pub enum Command {
         /// Key to remove.
         key: Vec<u8>,
     },
+    /// Compare-and-swap: update `key` only if its current value equals
+    /// `expected`.
+    Cas {
+        /// Key to update.
+        key: Vec<u8>,
+        /// Required current value; `None` means the key must be absent.
+        expected: Option<Vec<u8>>,
+        /// New value on success; `None` deletes the key.
+        value: Option<Vec<u8>>,
+    },
 }
