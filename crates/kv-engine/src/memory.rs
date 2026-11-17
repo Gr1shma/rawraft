@@ -32,6 +32,21 @@ impl Engine for MemEngine {
             },
         }
     }
+
+    fn snapshot(&self) -> crate::Result<Vec<u8>> {
+        Ok(bincode::serde::encode_to_vec(
+            &self.data,
+            bincode::config::standard(),
+        )?)
+    }
+
+    fn restore(&mut self, data: &[u8]) -> crate::Result<()> {
+        // Decode first and assign after, so a failure leaves `self` untouched.
+        let (map, _): (BTreeMap<Vec<u8>, Vec<u8>>, usize) =
+            bincode::serde::decode_from_slice(data, bincode::config::standard())?;
+        self.data = map;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -74,5 +89,50 @@ mod tests {
         assert_eq!(engine.apply(&del), Response::Deleted { existed: true });
         assert_eq!(engine.apply(&del), Response::Deleted { existed: false });
         assert_eq!(engine.apply(&get("a")), Response::Value(None));
+    }
+
+    #[test]
+    fn snapshot_restore_round_trip() {
+        let mut original = MemEngine::new();
+        original.apply(&put("a", "1"));
+        original.apply(&put("b", "2"));
+        let bytes = original.snapshot().unwrap();
+
+        let mut restored = MemEngine::new();
+        restored.restore(&bytes).unwrap();
+
+        assert_eq!(
+            restored.apply(&get("a")),
+            Response::Value(Some(b"1".to_vec()))
+        );
+        assert_eq!(
+            restored.apply(&get("b")),
+            Response::Value(Some(b"2".to_vec()))
+        );
+    }
+
+    #[test]
+    fn snapshot_is_independent_of_insert_order() {
+        let mut first = MemEngine::new();
+        first.apply(&put("a", "1"));
+        first.apply(&put("b", "2"));
+
+        let mut second = MemEngine::new();
+        second.apply(&put("b", "2"));
+        second.apply(&put("a", "1"));
+
+        assert_eq!(first.snapshot().unwrap(), second.snapshot().unwrap());
+    }
+
+    #[test]
+    fn restore_with_corrupt_data_leaves_state_unchanged() {
+        let mut engine = MemEngine::new();
+        engine.apply(&put("a", "1"));
+
+        assert!(engine.restore(b"garbage").is_err());
+        assert_eq!(
+            engine.apply(&get("a")),
+            Response::Value(Some(b"1".to_vec()))
+        );
     }
 }
