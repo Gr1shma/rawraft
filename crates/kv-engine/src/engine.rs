@@ -9,6 +9,9 @@ use crate::{Command, Response, Result};
 pub trait Engine {
     /// Applies `command` and returns its response.
     ///
+    /// Called only with committed entries, in log order, at most once per
+    /// entry. The result must depend on nothing that differs between nodes.
+    ///
     /// Logical outcomes such as "key not found" are part of the
     /// [`Response`], not errors.
     fn apply(&mut self, command: &Command) -> Response;
@@ -21,10 +24,20 @@ pub trait Engine {
     /// Returns [`Error::Encode`](crate::Error::Encode) if serialization fails.
     fn snapshot(&self) -> Result<Vec<u8>>;
 
-    /// Replaces the engine state with one produced by [`Engine::snapshot`].
+    /// Replaces the entire engine state with one produced by
+    /// [`Engine::snapshot`].
+    ///
+    /// This is a replacement, not a merge: state the snapshot does not contain
+    /// is discarded, including keys that exist only locally.
+    ///
+    /// Restoring must be atomic. If it fails, the existing state must be left
+    /// exactly as it was, because
+    /// [`StateMachine::restore`](crate::StateMachine::restore) restores the
+    /// engine before it touches the session table and relies on this.
     ///
     /// # Errors
-    /// Returns [`Error::Decode`](crate::Error::Decode) if `data` is corrupt.
-    /// On error the existing state is left unchanged.
+    /// Returns [`Error::Decode`](crate::Error::Decode) if `data` is corrupt, or
+    /// [`Error::TrailingBytes`](crate::Error::TrailingBytes) if `data` holds a
+    /// valid snapshot followed by extra bytes.
     fn restore(&mut self, data: &[u8]) -> Result<()>;
 }

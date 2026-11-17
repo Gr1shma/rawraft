@@ -1,7 +1,7 @@
 Jatayu is a distributed key-value store built in Rust using the Raft consensus algorithm.
 
 - [x] Workspace and crate skeleton
-- [ ] KV engine, session dedup, snapshot/restore
+- [x] KV engine, session dedup, snapshot/restore
 - [ ] In-memory Raft log storage
 - [ ] Leader election
 - [ ] Deterministic cluster simulator

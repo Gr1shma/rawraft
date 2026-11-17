@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 /// The result of applying a [`Command`](crate::Command).
+///
+/// # Encoding
+///
+/// The serialized form is part of the replicated log format, and variants
+/// encode by declaration index: only append new variants at the end. See the
+/// [crate docs](crate) for details.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     /// Result of a `Get`: the value, or `None` if the key does not exist.
@@ -16,7 +22,8 @@ pub enum Response {
     Cas {
         /// Whether the swap was performed.
         success: bool,
-        /// The value of the key after the operation.
+        /// On success, the value after the swap (`None` if the swap deleted the
+        /// key). On failure, the value that blocked the swap.
         current: Option<Vec<u8>>,
     },
 }
