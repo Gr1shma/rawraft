@@ -24,6 +24,8 @@ pub struct Raft {
     term: Term,
     voted_for: Option<NodeId>,
     votes: BTreeSet<NodeId>,
+    leader: Option<NodeId>,
+    heartbeat_elapsed: u64,
     log: RaftLog,
     ticks_elapsed: u64,
     election_timeout: u64,
@@ -42,6 +44,8 @@ impl Raft {
             term: 0,
             voted_for: None,
             votes: BTreeSet::new(),
+            leader: None,
+            heartbeat_elapsed: 0,
             log: RaftLog::new(),
             ticks_elapsed: 0,
             election_timeout: 0,
@@ -70,12 +74,24 @@ impl Raft {
         self.voted_for
     }
 
+    /// Returns the leader this node currently recognizes, if any.
+    ///
+    /// Followers use this to redirect clients.
+    #[must_use]
+    pub fn leader(&self) -> Option<NodeId> {
+        self.leader
+    }
+
     /// Advances time by one tick.
     ///
-    /// A follower or candidate that reaches its election timeout starts a
-    /// new election.
+    /// A leader sends a heartbeat when its interval elapses. A follower or
+    /// candidate that reaches its election timeout starts a new election.
     pub fn tick(&mut self) {
         if self.role == Role::Leader {
+            self.heartbeat_elapsed += 1;
+            if self.heartbeat_elapsed >= self.config.heartbeat_interval {
+                self.broadcast_heartbeat();
+            }
             return;
         }
         self.ticks_elapsed += 1;
@@ -105,6 +121,11 @@ impl Raft {
             Message::VoteResponse { term, granted } => {
                 self.handle_vote_response(from, term, granted);
             }
+            Message::AppendEntries { term, leader } => {
+                self.handle_append_entries(from, term, leader);
+            }
+            // Only the term check above matters until replication exists.
+            Message::AppendResponse { .. } => {}
         }
     }
 
@@ -119,6 +140,7 @@ impl Raft {
         self.voted_for = Some(self.config.id);
         self.votes.clear();
         self.votes.insert(self.config.id);
+        self.leader = None;
         self.reset_election_timer();
         self.persist_hard_state();
 
@@ -144,6 +166,7 @@ impl Raft {
         if term > self.term {
             self.term = term;
             self.voted_for = None;
+            self.leader = None;
             self.persist_hard_state();
         }
         self.reset_election_timer();
@@ -193,6 +216,51 @@ impl Raft {
 
     fn become_leader(&mut self) {
         self.role = Role::Leader;
+        self.leader = Some(self.config.id);
+        // Figure 2: on election, send an initial heartbeat to every server.
+        self.broadcast_heartbeat();
+    }
+
+    fn broadcast_heartbeat(&mut self) {
+        self.heartbeat_elapsed = 0;
+        let heartbeat = Message::AppendEntries {
+            term: self.term,
+            leader: self.config.id,
+        };
+        for &peer in &self.config.peers {
+            self.ready.messages.push((peer, heartbeat.clone()));
+        }
+    }
+
+    fn handle_append_entries(&mut self, from: NodeId, term: Term, leader: NodeId) {
+        // Rule 1: a leader from an older term is stale. Tell it our term.
+        if term < self.term {
+            self.ready.messages.push((
+                from,
+                Message::AppendResponse {
+                    term: self.term,
+                    success: false,
+                },
+            ));
+            return;
+        }
+        // Election safety makes two leaders in one term impossible, so a
+        // leader never gets here with an equal term. A higher term already
+        // made us a follower in `step`.
+        if self.role == Role::Leader {
+            return;
+        }
+        // A current leader exists: a candidate gives up, and a follower
+        // restarts its election timer.
+        self.become_follower(term);
+        self.leader = Some(leader);
+        self.ready.messages.push((
+            from,
+            Message::AppendResponse {
+                term: self.term,
+                success: true,
+            },
+        ));
     }
 
     /// Returns how many nodes make a majority of the cluster.
@@ -235,13 +303,29 @@ impl Raft {
 mod tests {
     use super::*;
 
+    /// Node 1 in a three-node cluster, with a heartbeat every 3 ticks.
     fn config(min: u64, max: u64) -> Config {
         Config {
             id: 1,
             peers: vec![2, 3],
             election_timeout_min: min,
             election_timeout_max: max,
+            heartbeat_interval: 3,
             seed: 42,
+        }
+    }
+
+    fn five_node_config() -> Config {
+        Config {
+            peers: vec![2, 3, 4, 5],
+            ..config(10, 10)
+        }
+    }
+
+    fn single_node_config() -> Config {
+        Config {
+            peers: vec![],
+            ..config(10, 10)
         }
     }
 
@@ -269,20 +353,27 @@ mod tests {
         Message::VoteResponse { term, granted }
     }
 
-    fn five_node_config() -> Config {
-        Config {
-            id: 1,
-            peers: vec![2, 3, 4, 5],
-            election_timeout_min: 10,
-            election_timeout_max: 10,
-            seed: 42,
-        }
+    fn append_entries(term: Term, leader: NodeId) -> Message {
+        Message::AppendEntries { term, leader }
     }
 
-    /// Returns a node that has just started an election in term 1.
+    fn append_response(term: Term, success: bool) -> Message {
+        Message::AppendResponse { term, success }
+    }
+
+    /// Returns a node that has just started an election in term 1,
+    /// with its `Ready` drained.
     fn candidate(config: Config) -> Raft {
         let mut raft = Raft::new(config);
         tick_n(&mut raft, 10);
+        raft.ready();
+        raft
+    }
+
+    /// Returns node 1 elected leader of term 1, with its `Ready` drained.
+    fn leader_of(config: Config) -> Raft {
+        let mut raft = candidate(config);
+        raft.step(2, vote_response(1, true));
         raft.ready();
         raft
     }
@@ -298,6 +389,8 @@ mod tests {
         }
         panic!("never became a candidate");
     }
+
+    // Election timeout
 
     #[test]
     fn new_node_is_a_follower_in_term_zero() {
@@ -337,12 +430,7 @@ mod tests {
                 voted_for: Some(1)
             })
         );
-        let request = Message::RequestVote {
-            term: 1,
-            candidate: 1,
-            last_log_index: 0,
-            last_log_term: 0,
-        };
+        let request = request_vote(1, 1, 0, 0);
         assert_eq!(ready.messages, vec![(2, request.clone()), (3, request)]);
     }
 
@@ -376,6 +464,8 @@ mod tests {
         assert_eq!(first, second);
         assert!((10..=20).contains(&first));
     }
+
+    // Handling RequestVote
 
     #[test]
     fn grants_first_vote_and_persists_it() {
@@ -487,9 +577,7 @@ mod tests {
 
     #[test]
     fn candidate_steps_down_on_a_request_from_a_higher_term() {
-        let mut raft = Raft::new(config(10, 10));
-        tick_n(&mut raft, 10);
-        raft.ready();
+        let mut raft = candidate(config(10, 10));
         assert_eq!(raft.role(), Role::Candidate);
 
         raft.step(3, request_vote(2, 3, 0, 0));
@@ -502,9 +590,7 @@ mod tests {
 
     #[test]
     fn candidate_rejects_a_request_from_its_own_term() {
-        let mut raft = Raft::new(config(10, 10));
-        tick_n(&mut raft, 10);
-        raft.ready();
+        let mut raft = candidate(config(10, 10));
 
         // It already voted for itself in term 1.
         raft.step(2, request_vote(1, 2, 0, 0));
@@ -515,9 +601,7 @@ mod tests {
 
     #[test]
     fn candidate_steps_down_on_a_response_from_a_higher_term() {
-        let mut raft = Raft::new(config(10, 10));
-        tick_n(&mut raft, 10);
-        raft.ready();
+        let mut raft = candidate(config(10, 10));
 
         raft.step(2, vote_response(2, false));
 
@@ -541,6 +625,8 @@ mod tests {
         assert_eq!(raft.role(), Role::Candidate);
         assert_eq!(raft.term(), 2);
     }
+
+    // Counting votes and winning
 
     #[test]
     fn candidate_becomes_leader_with_a_majority() {
@@ -599,8 +685,7 @@ mod tests {
 
     #[test]
     fn leader_does_not_start_elections() {
-        let mut raft = candidate(config(10, 10));
-        raft.step(2, vote_response(1, true));
+        let mut raft = leader_of(config(10, 10));
         tick_n(&mut raft, 100);
         assert_eq!(raft.role(), Role::Leader);
         assert_eq!(raft.term(), 1);
@@ -617,13 +702,7 @@ mod tests {
 
     #[test]
     fn single_node_cluster_wins_immediately() {
-        let mut raft = Raft::new(Config {
-            id: 1,
-            peers: vec![],
-            election_timeout_min: 10,
-            election_timeout_max: 10,
-            seed: 42,
-        });
+        let mut raft = Raft::new(single_node_config());
         tick_n(&mut raft, 10);
 
         assert_eq!(raft.role(), Role::Leader);
@@ -641,9 +720,7 @@ mod tests {
 
     #[test]
     fn leader_steps_down_on_a_request_from_a_higher_term() {
-        let mut raft = candidate(config(10, 10));
-        raft.step(2, vote_response(1, true));
-        raft.ready();
+        let mut raft = leader_of(config(10, 10));
 
         raft.step(3, request_vote(2, 3, 0, 0));
 
@@ -654,9 +731,7 @@ mod tests {
 
     #[test]
     fn leader_rejects_a_vote_request_in_its_own_term() {
-        let mut raft = candidate(config(10, 10));
-        raft.step(2, vote_response(1, true));
-        raft.ready();
+        let mut raft = leader_of(config(10, 10));
 
         raft.step(3, request_vote(1, 3, 0, 0));
 
@@ -669,5 +744,148 @@ mod tests {
         let mut raft = Raft::new(config(10, 10));
         raft.step(2, vote_response(0, true));
         assert_eq!(raft.role(), Role::Follower);
+    }
+
+    // Heartbeats
+
+    #[test]
+    fn new_leader_sends_a_heartbeat_to_every_peer_immediately() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, vote_response(1, true));
+
+        assert_eq!(raft.leader(), Some(1));
+        assert_eq!(
+            raft.ready().messages,
+            vec![(2, append_entries(1, 1)), (3, append_entries(1, 1))]
+        );
+    }
+
+    #[test]
+    fn leader_sends_heartbeats_every_interval() {
+        let mut raft = leader_of(config(10, 10));
+
+        tick_n(&mut raft, 2);
+        assert!(raft.ready().messages.is_empty());
+        raft.tick();
+        assert_eq!(
+            raft.ready().messages,
+            vec![(2, append_entries(1, 1)), (3, append_entries(1, 1))]
+        );
+
+        tick_n(&mut raft, 2);
+        assert!(raft.ready().messages.is_empty());
+        raft.tick();
+        assert_eq!(raft.ready().messages.len(), 2);
+    }
+
+    #[test]
+    fn follower_accepts_a_heartbeat_learns_the_leader_and_restarts_its_timer() {
+        let mut raft = Raft::new(config(10, 10));
+        tick_n(&mut raft, 9);
+        raft.step(2, append_entries(1, 2));
+        let ready = raft.ready();
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 1);
+        assert_eq!(raft.leader(), Some(2));
+        assert_eq!(ready.messages, vec![(2, append_response(1, true))]);
+        assert_eq!(
+            ready.hard_state,
+            Some(HardState {
+                current_term: 1,
+                voted_for: None
+            })
+        );
+
+        // The timer restarted, so 9 more ticks are not enough.
+        tick_n(&mut raft, 9);
+        assert_eq!(raft.role(), Role::Follower);
+        raft.tick();
+        assert_eq!(raft.role(), Role::Candidate);
+        assert_eq!(raft.term(), 2);
+    }
+
+    #[test]
+    fn regular_heartbeats_keep_a_follower_from_starting_an_election() {
+        let mut raft = Raft::new(config(10, 10));
+        for _ in 0..100 {
+            tick_n(&mut raft, 5);
+            raft.step(2, append_entries(1, 2));
+        }
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 1);
+    }
+
+    #[test]
+    fn follower_rejects_a_heartbeat_from_a_lower_term_without_restarting_its_timer() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.term = 5;
+        tick_n(&mut raft, 9);
+        raft.step(2, append_entries(3, 2));
+        let ready = raft.ready();
+
+        assert_eq!(ready.messages, vec![(2, append_response(5, false))]);
+        assert_eq!(ready.hard_state, None);
+        assert_eq!(raft.leader(), None);
+
+        // The stale heartbeat must not have reset the timer.
+        raft.tick();
+        assert_eq!(raft.role(), Role::Candidate);
+        assert_eq!(raft.term(), 6);
+    }
+
+    #[test]
+    fn candidate_steps_down_for_a_leader_of_its_own_term() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, append_entries(1, 2));
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 1);
+        assert_eq!(raft.voted_for(), Some(1));
+        assert_eq!(raft.leader(), Some(2));
+        assert_eq!(raft.ready().messages, vec![(2, append_response(1, true))]);
+    }
+
+    #[test]
+    fn candidate_ignores_a_heartbeat_from_a_stale_leader() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, append_entries(0, 2));
+
+        assert_eq!(raft.role(), Role::Candidate);
+        assert_eq!(raft.ready().messages, vec![(2, append_response(1, false))]);
+    }
+
+    #[test]
+    fn leader_steps_down_for_a_heartbeat_from_a_higher_term() {
+        let mut raft = leader_of(config(10, 10));
+        raft.step(3, append_entries(2, 3));
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 2);
+        assert_eq!(raft.leader(), Some(3));
+        assert_eq!(raft.ready().messages, vec![(3, append_response(2, true))]);
+
+        // It no longer sends heartbeats of its own.
+        tick_n(&mut raft, 3);
+        assert!(raft.ready().messages.is_empty());
+    }
+
+    #[test]
+    fn leader_ignores_a_heartbeat_in_its_own_term() {
+        // Impossible in a correct cluster; the leader must not step down.
+        let mut raft = leader_of(config(10, 10));
+        raft.step(3, append_entries(1, 3));
+
+        assert_eq!(raft.role(), Role::Leader);
+        assert!(raft.ready().messages.is_empty());
+    }
+
+    #[test]
+    fn leader_steps_down_on_a_response_from_a_higher_term() {
+        let mut raft = leader_of(config(10, 10));
+        raft.step(2, append_response(2, false));
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 2);
     }
 }

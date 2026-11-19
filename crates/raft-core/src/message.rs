@@ -21,6 +21,23 @@ pub enum Message {
         /// Whether the vote was granted.
         granted: bool,
     },
+    /// A leader asserts its authority.
+    ///
+    /// For now this carries no log entries, so it works as a heartbeat.
+    /// The replication fields are added with log replication.
+    AppendEntries {
+        /// The leader's term.
+        term: Term,
+        /// The leader, so followers know where to redirect clients.
+        leader: NodeId,
+    },
+    /// The answer to an `AppendEntries`.
+    AppendResponse {
+        /// The receiver's current term, so a stale leader can step down.
+        term: Term,
+        /// Whether the receiver accepted the sender as leader.
+        success: bool,
+    },
 }
 
 impl Message {
@@ -28,7 +45,10 @@ impl Message {
     #[must_use]
     pub fn term(&self) -> Term {
         match self {
-            Self::RequestVote { term, .. } | Self::VoteResponse { term, .. } => *term,
+            Self::RequestVote { term, .. }
+            | Self::VoteResponse { term, .. }
+            | Self::AppendEntries { term, .. }
+            | Self::AppendResponse { term, .. } => *term,
         }
     }
 }
