@@ -2,8 +2,8 @@ rawraft is a distributed key-value store built in Rust using the Raft consensus 
 
 - [x] Workspace and crate skeleton
 - [x] KV engine, session dedup, snapshot/restore
-- [ ] Raft core types and in-memory log storage
-- [ ] Leader election
+- [x] Raft core types and in-memory log storage
+- [ ] Leader election (state machine done, cluster test pending)
 - [ ] Deterministic cluster simulator
 - [ ] Log replication and commit
 - [ ] Durable storage (WAL, crash recovery)
