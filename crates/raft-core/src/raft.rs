@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::{Config, HardState, Index, Message, NodeId, RaftLog, Ready, Term};
 
 /// The role a node currently plays.
@@ -21,6 +23,7 @@ pub struct Raft {
     role: Role,
     term: Term,
     voted_for: Option<NodeId>,
+    votes: BTreeSet<NodeId>,
     log: RaftLog,
     ticks_elapsed: u64,
     election_timeout: u64,
@@ -38,6 +41,7 @@ impl Raft {
             role: Role::Follower,
             term: 0,
             voted_for: None,
+            votes: BTreeSet::new(),
             log: RaftLog::new(),
             ticks_elapsed: 0,
             election_timeout: 0,
@@ -98,7 +102,9 @@ impl Raft {
             } => {
                 self.handle_request_vote(from, term, candidate, last_log_index, last_log_term);
             }
-            Message::VoteResponse { .. } => {}
+            Message::VoteResponse { term, granted } => {
+                self.handle_vote_response(from, term, granted);
+            }
         }
     }
 
@@ -111,8 +117,9 @@ impl Raft {
         self.role = Role::Candidate;
         self.term += 1;
         self.voted_for = Some(self.config.id);
+        self.votes.clear();
+        self.votes.insert(self.config.id);
         self.reset_election_timer();
-
         self.persist_hard_state();
 
         let request = Message::RequestVote {
@@ -124,10 +131,16 @@ impl Raft {
         for &peer in &self.config.peers {
             self.ready.messages.push((peer, request.clone()));
         }
+
+        // A single-node cluster already has its majority.
+        if self.votes.len() >= self.quorum() {
+            self.become_leader();
+        }
     }
 
     fn become_follower(&mut self, term: Term) {
         self.role = Role::Follower;
+        self.votes.clear();
         if term > self.term {
             self.term = term;
             self.voted_for = None;
@@ -163,6 +176,31 @@ impl Raft {
                 granted,
             },
         ));
+    }
+
+    fn handle_vote_response(&mut self, from: NodeId, term: Term, granted: bool) {
+        // Only count grants for the election we are running right now.
+        // A higher term already turned us into a follower in `step`, and a
+        // lower term is a late reply from an earlier election.
+        if self.role != Role::Candidate || term != self.term || !granted {
+            return;
+        }
+        self.votes.insert(from);
+        if self.votes.len() >= self.quorum() {
+            self.become_leader();
+        }
+    }
+
+    fn become_leader(&mut self) {
+        self.role = Role::Leader;
+    }
+
+    /// Returns how many nodes make a majority of the cluster.
+    ///
+    /// `peers` excludes this node, so the cluster has `peers.len() + 1`
+    /// nodes and its majority is half of that, rounded up.
+    fn quorum(&self) -> usize {
+        self.config.peers.len().div_ceil(2) + 1
     }
 
     /// Records that term or vote changed and must be saved before sending.
@@ -229,6 +267,24 @@ mod tests {
 
     fn vote_response(term: Term, granted: bool) -> Message {
         Message::VoteResponse { term, granted }
+    }
+
+    fn five_node_config() -> Config {
+        Config {
+            id: 1,
+            peers: vec![2, 3, 4, 5],
+            election_timeout_min: 10,
+            election_timeout_max: 10,
+            seed: 42,
+        }
+    }
+
+    /// Returns a node that has just started an election in term 1.
+    fn candidate(config: Config) -> Raft {
+        let mut raft = Raft::new(config);
+        tick_n(&mut raft, 10);
+        raft.ready();
+        raft
     }
 
     /// Ticks until the node becomes a candidate and returns how many it took.
@@ -484,5 +540,134 @@ mod tests {
         raft.tick();
         assert_eq!(raft.role(), Role::Candidate);
         assert_eq!(raft.term(), 2);
+    }
+
+    #[test]
+    fn candidate_becomes_leader_with_a_majority() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, vote_response(1, true));
+        assert_eq!(raft.role(), Role::Leader);
+        assert_eq!(raft.term(), 1);
+    }
+
+    #[test]
+    fn five_node_cluster_needs_three_votes() {
+        let mut raft = candidate(five_node_config());
+        raft.step(2, vote_response(1, true));
+        assert_eq!(raft.role(), Role::Candidate);
+        raft.step(3, vote_response(1, true));
+        assert_eq!(raft.role(), Role::Leader);
+    }
+
+    #[test]
+    fn rejected_votes_do_not_count() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, vote_response(1, false));
+        raft.step(3, vote_response(1, false));
+        assert_eq!(raft.role(), Role::Candidate);
+    }
+
+    #[test]
+    fn duplicate_grant_from_one_peer_counts_once() {
+        let mut raft = candidate(five_node_config());
+        raft.step(2, vote_response(1, true));
+        raft.step(2, vote_response(1, true));
+        assert_eq!(raft.role(), Role::Candidate);
+    }
+
+    #[test]
+    fn grant_for_an_earlier_election_is_ignored() {
+        let mut raft = candidate(config(10, 10));
+        tick_n(&mut raft, 10); // times out again, now in term 2
+        assert_eq!(raft.term(), 2);
+
+        raft.step(2, vote_response(1, true));
+        assert_eq!(raft.role(), Role::Candidate);
+    }
+
+    #[test]
+    fn votes_are_cleared_for_each_new_election() {
+        let mut raft = candidate(five_node_config());
+        raft.step(2, vote_response(1, true));
+        tick_n(&mut raft, 10); // new election, term 2
+        assert_eq!(raft.term(), 2);
+
+        raft.step(3, vote_response(2, true));
+        // Only nodes 1 and 3 voted in term 2. Node 2's old vote must not count.
+        assert_eq!(raft.role(), Role::Candidate);
+    }
+
+    #[test]
+    fn leader_does_not_start_elections() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, vote_response(1, true));
+        tick_n(&mut raft, 100);
+        assert_eq!(raft.role(), Role::Leader);
+        assert_eq!(raft.term(), 1);
+    }
+
+    #[test]
+    fn extra_grants_after_winning_change_nothing() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, vote_response(1, true));
+        raft.step(3, vote_response(1, true));
+        assert_eq!(raft.role(), Role::Leader);
+        assert_eq!(raft.term(), 1);
+    }
+
+    #[test]
+    fn single_node_cluster_wins_immediately() {
+        let mut raft = Raft::new(Config {
+            id: 1,
+            peers: vec![],
+            election_timeout_min: 10,
+            election_timeout_max: 10,
+            seed: 42,
+        });
+        tick_n(&mut raft, 10);
+
+        assert_eq!(raft.role(), Role::Leader);
+        assert_eq!(raft.term(), 1);
+        let ready = raft.ready();
+        assert!(ready.messages.is_empty());
+        assert_eq!(
+            ready.hard_state,
+            Some(HardState {
+                current_term: 1,
+                voted_for: Some(1)
+            })
+        );
+    }
+
+    #[test]
+    fn leader_steps_down_on_a_request_from_a_higher_term() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, vote_response(1, true));
+        raft.ready();
+
+        raft.step(3, request_vote(2, 3, 0, 0));
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 2);
+        assert_eq!(raft.ready().messages, vec![(3, vote_response(2, true))]);
+    }
+
+    #[test]
+    fn leader_rejects_a_vote_request_in_its_own_term() {
+        let mut raft = candidate(config(10, 10));
+        raft.step(2, vote_response(1, true));
+        raft.ready();
+
+        raft.step(3, request_vote(1, 3, 0, 0));
+
+        assert_eq!(raft.role(), Role::Leader);
+        assert_eq!(raft.ready().messages, vec![(3, vote_response(1, false))]);
+    }
+
+    #[test]
+    fn follower_ignores_vote_responses() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.step(2, vote_response(0, true));
+        assert_eq!(raft.role(), Role::Follower);
     }
 }
