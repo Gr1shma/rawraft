@@ -22,3 +22,13 @@ pub enum Message {
         granted: bool,
     },
 }
+
+impl Message {
+    /// Returns the term carried by this message.
+    #[must_use]
+    pub fn term(&self) -> Term {
+        match self {
+            Self::RequestVote { term, .. } | Self::VoteResponse { term, .. } => *term,
+        }
+    }
+}

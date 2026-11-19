@@ -1,4 +1,4 @@
-use crate::{Config, HardState, Message, NodeId, RaftLog, Ready, Term};
+use crate::{Config, HardState, Index, Message, NodeId, RaftLog, Ready, Term};
 
 /// The role a node currently plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +80,28 @@ impl Raft {
         }
     }
 
+    /// Handles a message received from node `from`.
+    ///
+    /// Replies and state changes are collected in [`Raft::ready`].
+    pub fn step(&mut self, from: NodeId, message: Message) {
+        // rules for all servers: a higher term always wins.
+        if message.term() > self.term {
+            self.become_follower(message.term());
+        }
+
+        match message {
+            Message::RequestVote {
+                term,
+                candidate,
+                last_log_index,
+                last_log_term,
+            } => {
+                self.handle_request_vote(from, term, candidate, last_log_index, last_log_term);
+            }
+            Message::VoteResponse { .. } => {}
+        }
+    }
+
     /// Takes everything the runtime must persist and send.
     pub fn ready(&mut self) -> Ready {
         std::mem::take(&mut self.ready)
@@ -91,10 +113,7 @@ impl Raft {
         self.voted_for = Some(self.config.id);
         self.reset_election_timer();
 
-        self.ready.hard_state = Some(HardState {
-            current_term: self.term,
-            voted_for: self.voted_for,
-        });
+        self.persist_hard_state();
 
         let request = Message::RequestVote {
             term: self.term,
@@ -105,6 +124,53 @@ impl Raft {
         for &peer in &self.config.peers {
             self.ready.messages.push((peer, request.clone()));
         }
+    }
+
+    fn become_follower(&mut self, term: Term) {
+        self.role = Role::Follower;
+        if term > self.term {
+            self.term = term;
+            self.voted_for = None;
+            self.persist_hard_state();
+        }
+        self.reset_election_timer();
+    }
+
+    fn handle_request_vote(
+        &mut self,
+        from: NodeId,
+        term: Term,
+        candidate: NodeId,
+        last_log_index: Index,
+        last_log_term: Term,
+    ) {
+        // Comparing (term, index) pairs checks the term first, then the length.
+        let log_is_current =
+            (last_log_term, last_log_index) >= (self.log.last_term(), self.log.last_index());
+        let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate);
+        // A lower term is rejected. A higher term was already adopted in `step`.
+        let granted = term == self.term && can_vote && log_is_current;
+
+        if granted {
+            self.voted_for = Some(candidate);
+            self.persist_hard_state();
+            self.reset_election_timer();
+        }
+        self.ready.messages.push((
+            from,
+            Message::VoteResponse {
+                term: self.term,
+                granted,
+            },
+        ));
+    }
+
+    /// Records that term or vote changed and must be saved before sending.
+    fn persist_hard_state(&mut self) {
+        self.ready.hard_state = Some(HardState {
+            current_term: self.term,
+            voted_for: self.voted_for,
+        });
     }
 
     /// Picks a new random election timeout and restarts the countdown.
@@ -145,6 +211,24 @@ mod tests {
         for _ in 0..n {
             raft.tick();
         }
+    }
+
+    fn request_vote(
+        term: Term,
+        candidate: NodeId,
+        last_log_index: Index,
+        last_log_term: Term,
+    ) -> Message {
+        Message::RequestVote {
+            term,
+            candidate,
+            last_log_index,
+            last_log_term,
+        }
+    }
+
+    fn vote_response(term: Term, granted: bool) -> Message {
+        Message::VoteResponse { term, granted }
     }
 
     /// Ticks until the node becomes a candidate and returns how many it took.
@@ -235,5 +319,170 @@ mod tests {
         let second = ticks_until_candidate(config(10, 20));
         assert_eq!(first, second);
         assert!((10..=20).contains(&first));
+    }
+
+    #[test]
+    fn grants_first_vote_and_persists_it() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.step(2, request_vote(1, 2, 0, 0));
+        let ready = raft.ready();
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 1);
+        assert_eq!(raft.voted_for(), Some(2));
+        assert_eq!(ready.messages, vec![(2, vote_response(1, true))]);
+        assert_eq!(
+            ready.hard_state,
+            Some(HardState {
+                current_term: 1,
+                voted_for: Some(2)
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_request_from_a_lower_term() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.term = 5;
+        raft.step(2, request_vote(3, 2, 0, 0));
+        let ready = raft.ready();
+
+        assert_eq!(raft.term(), 5);
+        assert_eq!(ready.messages, vec![(2, vote_response(5, false))]);
+        assert_eq!(ready.hard_state, None);
+    }
+
+    #[test]
+    fn votes_for_only_one_candidate_per_term() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.step(2, request_vote(1, 2, 0, 0));
+        raft.step(3, request_vote(1, 3, 0, 0));
+        let ready = raft.ready();
+
+        assert_eq!(raft.voted_for(), Some(2));
+        assert_eq!(
+            ready.messages,
+            vec![(2, vote_response(1, true)), (3, vote_response(1, false))]
+        );
+    }
+
+    #[test]
+    fn repeated_request_from_the_same_candidate_is_granted_again() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.step(2, request_vote(1, 2, 0, 0));
+        raft.step(2, request_vote(1, 2, 0, 0));
+        let ready = raft.ready();
+
+        assert_eq!(
+            ready.messages,
+            vec![(2, vote_response(1, true)), (2, vote_response(1, true))]
+        );
+    }
+
+    #[test]
+    fn rejects_a_candidate_with_an_older_last_term_even_if_its_log_is_longer() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.log.push(2, Vec::new());
+        raft.step(2, request_vote(1, 2, 5, 1));
+        let ready = raft.ready();
+
+        assert_eq!(ready.messages, vec![(2, vote_response(1, false))]);
+        // The higher term is still adopted, and the vote stays free.
+        assert_eq!(raft.term(), 1);
+        assert_eq!(raft.voted_for(), None);
+        assert_eq!(
+            ready.hard_state,
+            Some(HardState {
+                current_term: 1,
+                voted_for: None
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_candidate_with_the_same_last_term_but_a_shorter_log() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.log.push(2, Vec::new());
+        raft.log.push(2, Vec::new());
+        raft.step(2, request_vote(1, 2, 1, 2));
+
+        assert_eq!(raft.ready().messages, vec![(2, vote_response(1, false))]);
+    }
+
+    #[test]
+    fn grants_a_candidate_whose_log_is_equally_up_to_date() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.log.push(2, Vec::new());
+        raft.log.push(2, Vec::new());
+        raft.step(2, request_vote(1, 2, 2, 2));
+
+        assert_eq!(raft.ready().messages, vec![(2, vote_response(1, true))]);
+    }
+
+    #[test]
+    fn grants_a_candidate_with_a_newer_last_term_even_if_its_log_is_shorter() {
+        let mut raft = Raft::new(config(10, 10));
+        raft.log.push(2, Vec::new());
+        raft.log.push(2, Vec::new());
+        raft.step(2, request_vote(1, 2, 1, 3));
+
+        assert_eq!(raft.ready().messages, vec![(2, vote_response(1, true))]);
+    }
+
+    #[test]
+    fn candidate_steps_down_on_a_request_from_a_higher_term() {
+        let mut raft = Raft::new(config(10, 10));
+        tick_n(&mut raft, 10);
+        raft.ready();
+        assert_eq!(raft.role(), Role::Candidate);
+
+        raft.step(3, request_vote(2, 3, 0, 0));
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 2);
+        assert_eq!(raft.voted_for(), Some(3));
+        assert_eq!(raft.ready().messages, vec![(3, vote_response(2, true))]);
+    }
+
+    #[test]
+    fn candidate_rejects_a_request_from_its_own_term() {
+        let mut raft = Raft::new(config(10, 10));
+        tick_n(&mut raft, 10);
+        raft.ready();
+
+        // It already voted for itself in term 1.
+        raft.step(2, request_vote(1, 2, 0, 0));
+
+        assert_eq!(raft.role(), Role::Candidate);
+        assert_eq!(raft.ready().messages, vec![(2, vote_response(1, false))]);
+    }
+
+    #[test]
+    fn candidate_steps_down_on_a_response_from_a_higher_term() {
+        let mut raft = Raft::new(config(10, 10));
+        tick_n(&mut raft, 10);
+        raft.ready();
+
+        raft.step(2, vote_response(2, false));
+
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 2);
+        assert_eq!(raft.voted_for(), None);
+    }
+
+    #[test]
+    fn granting_a_vote_restarts_the_election_timer() {
+        let mut raft = Raft::new(config(10, 10));
+        tick_n(&mut raft, 9);
+        raft.step(2, request_vote(1, 2, 0, 0));
+
+        // The countdown restarted, so 9 more ticks are not enough.
+        tick_n(&mut raft, 9);
+        assert_eq!(raft.role(), Role::Follower);
+        assert_eq!(raft.term(), 1);
+
+        raft.tick();
+        assert_eq!(raft.role(), Role::Candidate);
+        assert_eq!(raft.term(), 2);
     }
 }
